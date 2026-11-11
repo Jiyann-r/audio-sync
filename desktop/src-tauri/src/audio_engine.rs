@@ -759,22 +759,22 @@ fn run_vbcable_mic_worker(
         .play()
         .map_err(|e| AudioEngineError::PlayStreamError(e.to_string()))?;
 
-    let initial_jitter = config.lock().jitter_buffer_packets;
+    let initial_jitter = config.lock().jitter_buffer_packets.max(3);
     let mut dsp = MicDspPipeline::new(initial_jitter)?;
 
     while running.load(Ordering::Relaxed) {
         match inbound_mic_rx.try_recv() {
             Ok(pkt) => {
                 let cfg_snapshot = config.lock().clone();
-                dsp.ingest_packet(pkt, cfg_snapshot.jitter_buffer_packets);
+                dsp.ingest_packet(pkt, cfg_snapshot.jitter_buffer_packets.max(3));
                 // Drain any immediately queued packets before running DSP
                 while let Ok(more_pkt) = inbound_mic_rx.try_recv() {
-                    dsp.ingest_packet(more_pkt, cfg_snapshot.jitter_buffer_packets);
+                    dsp.ingest_packet(more_pkt, cfg_snapshot.jitter_buffer_packets.max(3));
                 }
                 dsp.process_available(&cfg_snapshot, &telemetry, &output_ring);
             }
             Err(mpsc::error::TryRecvError::Empty) => {
-                std::thread::sleep(std::time::Duration::from_millis(3));
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
         }

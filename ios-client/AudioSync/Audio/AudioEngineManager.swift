@@ -429,7 +429,7 @@ public final class AudioEngineManager: ObservableObject {
     private weak var networkClient: NetworkClient?
     private var micEncoder: SwiftOpusEncoder?
     private var pcDecoder: SwiftOpusDecoder?
-    private let pcJitterBuffer = IosAdaptiveJitterBuffer(targetDepth: 2)
+    private let pcJitterBuffer = IosAdaptiveJitterBuffer(targetDepth: 3)
 
     private var micSampleFifo: [Float] = []
     private var playbackFormat: AVAudioFormat?
@@ -445,7 +445,7 @@ public final class AudioEngineManager: ObservableObject {
             sampleRate: kOpusSampleRateInt,
             channels: 2
         )
-        self.micSampleFifo.reserveCapacity(kFrameSamples20ms * 4)
+        self.micSampleFifo.reserveCapacity(kFrameSamples20ms * 8)
 
         bindNetworkCallbacks()
         setupAudioSessionNotifications()
@@ -456,12 +456,14 @@ public final class AudioEngineManager: ObservableObject {
         bindNetworkCallbacks()
     }
 
-    // MARK: - 1. AVAudioSession Configuration (5ms Low-Latency + Background Audio & VoIP)
+    // MARK: - 1. AVAudioSession Configuration (Full-Fidelity Media Playback & Mic)
 
     public func configureAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
 
-        // Configure .playAndRecord with .voiceChat mode and [.defaultToSpeaker, .allowBluetoothHFP, .mixWithOthers]
+        // Use .default mode with [.defaultToSpeaker, .allowBluetoothHFP, .mixWithOthers]
+        // Note: .voiceChat or .videoChat forces iOS into telephone bandpass call mode (routed to earpiece receiver with mono 16kHz low volume!).
+        // Using mode .default preserves pristine, full-volume stereo media playback on the main iPhone speakers!
         var options: AVAudioSession.CategoryOptions = [
             .defaultToSpeaker,
             .allowBluetoothHFP,
@@ -473,13 +475,14 @@ public final class AudioEngineManager: ObservableObject {
 
         try session.setCategory(
             .playAndRecord,
-            mode: .voiceChat,
+            mode: .default,
             options: options
         )
 
-        // Request 48,000 Hz native hardware clock and 5ms (0.005s) ultra-low IO buffer duration
+        // Request 48,000 Hz native hardware clock and 10ms (0.010s) IO buffer duration
+        // 10ms provides smooth uninterrupted streaming without buffer under-runs on iPhone hardware
         try session.setPreferredSampleRate(kOpusSampleRate)
-        try session.setPreferredIOBufferDuration(kPreferredIOBufferDuration)
+        try session.setPreferredIOBufferDuration(0.010)
         try session.setActive(true, options: .notifyOthersOnDeactivation)
     }
 
@@ -489,20 +492,12 @@ public final class AudioEngineManager: ObservableObject {
             switch selectedOutputRoute {
             case .speaker:
                 try session.overrideOutputAudioPort(.speaker)
-                publishAudioStatus("Output Route: iPhone Speaker")
+                publishAudioStatus("Output Route: Main iPhone Loudspeaker (Full Fidelity)")
             case .earpiece:
                 try session.overrideOutputAudioPort(.none)
-                if let builtInMic = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
-                    try? session.setPreferredInput(builtInMic)
-                }
-                publishAudioStatus("Output Route: iPhone Earpiece Receiver")
+                publishAudioStatus("Output Route: iPhone Earpiece Receiver (Private Call)")
             case .bluetooth:
                 try session.overrideOutputAudioPort(.none)
-                if let btInput = session.availableInputs?.first(where: {
-                    $0.portType == .bluetoothHFP || $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE
-                }) {
-                    try? session.setPreferredInput(btInput)
-                }
                 publishAudioStatus("Output Route: Bluetooth Headset / AirPods")
             }
         } catch {
@@ -607,6 +602,9 @@ public final class AudioEngineManager: ObservableObject {
         audioEngine.prepare()
         try audioEngine.start()
         playerNode.play()
+
+        // Explicitly enforce the output route immediately after engine starts
+        updateAudioOutputRoute()
     }
 
     // MARK: - 3. Microphone Capture -> 48kHz Mono Conversion -> Opus Encode -> UDP `PhoneToPc`
