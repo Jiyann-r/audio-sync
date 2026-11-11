@@ -284,7 +284,15 @@ impl NetworkEngine {
                                                 }
                                             }
                                             last_inbound_mic_seq = Some(packet.header.sequence_num);
-                                            let _ = inbound_mic_tx.try_send(packet);
+                                            crate::diag::on_mic_packet(
+                                                packet.header.sequence_num,
+                                                packet.header.timestamp,
+                                                packet.payload.len(),
+                                            );
+                                            crate::diag::dump_raw(&packet.payload);
+                                            if inbound_mic_tx.try_send(packet).is_err() {
+                                                crate::diag::inc(&crate::diag::CHAN_FULL_DROPS);
+                                            }
                                         }
                                     }
                                     PacketType::Ping => {

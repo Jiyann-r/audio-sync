@@ -615,6 +615,14 @@ public final class AudioEngineManager: ObservableObject {
         try audioEngine.start()
         playerNode.play()
 
+        // DIAG
+        let s = AVAudioSession.sharedInstance()
+        print("[DIAG iOS CFG] session.sampleRate=\(s.sampleRate) preferredSR=\(s.preferredSampleRate) ioBufferDuration=\(s.ioBufferDuration)s (\(Int(s.ioBufferDuration * s.sampleRate)) frames) inputLatency=\(s.inputLatency) inputCh=\(s.inputNumberOfChannels) mode=\(s.mode.rawValue)")
+        print("[DIAG iOS CFG] inputs=\(s.currentRoute.inputs.map { "\($0.portType.rawValue):\($0.portName)" }) outputs=\(s.currentRoute.outputs.map { $0.portType.rawValue })")
+        print("[DIAG iOS CFG] hwInputFormat=\(hwInputFormat) interleaved=\(hwInputFormat.isInterleaved) commonFormat=\(hwInputFormat.commonFormat.rawValue) tapRequestedFrames=\(tapBufferFrames) resamplePath=\(abs(hwSampleRate - kOpusSampleRate) >= 1.0) frameDurationMs=\(frameDurationMs) micGainDb=\(micGainDb)")
+        print("[DIAG iOS CFG] lowPowerMode=\(ProcessInfo.processInfo.isLowPowerModeEnabled) thermal=\(ProcessInfo.processInfo.thermalState.rawValue)")
+        MicDiag.shared.start()
+
         // Explicitly enforce the output route immediately after engine starts
         updateAudioOutputRoute()
     }
@@ -633,6 +641,8 @@ public final class AudioEngineManager: ObservableObject {
             && !isMicMuted
             && (!pushToTalkEnabled || pushToTalkActive)
 
+        MicDiag.shared.onTap(frames: frameCount, gated: !canTransmit) // DIAG
+
         if !canTransmit {
             DispatchQueue.main.async {
                 self.micPeakLevel = 0.0
@@ -644,8 +654,19 @@ public final class AudioEngineManager: ObservableObject {
         let srcChannel0 = channelData[0]
         let gainLinear = powf(10.0, micGainDb / 20.0)
 
+        // DIAG: snapshot while the buffer is guaranteed valid (we are still inside the tap block)
+        let diagEnqueuedNs = MicDiag.nowNs()
+        let diagSnapshot = Array(UnsafeBufferPointer(start: srcChannel0, count: frameCount))
+
         audioQueue.async { [weak self] in
             guard let self = self else { return }
+
+            // DIAG: did the tap buffer's memory change after the tap block returned? (tests H1)
+            let diagChanged = diagSnapshot.withUnsafeBufferPointer { snap in
+                guard let snapBase = snap.baseAddress else { return false }
+                return memcmp(snapBase, srcChannel0, frameCount * MemoryLayout<Float>.size) != 0
+            }
+            MicDiag.shared.onHandoff(enqueuedNs: diagEnqueuedNs, bufferChangedAfterTapReturned: diagChanged)
 
             if abs(sourceRate - kOpusSampleRate) < 1.0 {
                 for i in 0..<frameCount {
@@ -672,6 +693,7 @@ public final class AudioEngineManager: ObservableObject {
             let targetFrameSamples = (self.frameDurationMs == 20) ? kFrameSamples20ms : kFrameSamples10ms
 
             while self.micSampleFifo.count >= targetFrameSamples {
+                MicDiag.shared.onFramePacked(fifoCount: self.micSampleFifo.count) // DIAG
                 let pcmFrame = Array(self.micSampleFifo.prefix(targetFrameSamples))
                 self.micSampleFifo.removeFirst(targetFrameSamples)
 

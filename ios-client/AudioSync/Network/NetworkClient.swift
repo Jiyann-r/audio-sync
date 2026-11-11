@@ -698,6 +698,7 @@ public final class NetworkClient: ObservableObject {
     public func sendMicrophoneOpusFrame(_ opusData: Data) {
         netQueue.async { [weak self] in
             guard let self = self else { return }
+            MicDiag.shared.onMicSend(payloadBytes: opusData.count) // DIAG
             let seq = self.outboundMicSeq
             self.outboundMicSeq &+= 1
             let ts = self.currentTimestampMicros()
@@ -756,9 +757,14 @@ public final class NetworkClient: ObservableObject {
     }
 
     private func sendRawFramedPacketOnQueue(_ packet: FramedPacket) {
-        guard let conn = connection else { return }
+        guard let conn = connection else {
+            MicDiag.shared.onSendNoConnection() // DIAG
+            return
+        }
         let wireData = packet.encode()
+        MicDiag.shared.onSendIssued() // DIAG
         conn.send(content: wireData, completion: .contentProcessed { [weak self] error in
+            MicDiag.shared.onSendCompleted(error: error) // DIAG
             guard let self = self else { return }
             if error == nil {
                 self.internalPacketsSent &+= 1

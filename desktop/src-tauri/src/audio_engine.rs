@@ -177,11 +177,13 @@ impl AdaptiveJitterBuffer {
         if let Some(expected) = self.next_expected_seq {
             let diff = sequence_diff(seq, expected);
             if diff < -32 {
+                crate::diag::inc(&crate::diag::JB_RESETS); // DIAG
                 // Stream likely restarted on the iPhone client; reset sequence tracking.
                 self.packets.clear();
                 self.next_expected_seq = Some(seq);
                 self.primed = false;
             } else if diff < 0 {
+                crate::diag::inc(&crate::diag::JB_LATE_DROPS); // DIAG
                 // Late packet that has already been concealed/played; drop it.
                 return;
             }
@@ -193,6 +195,7 @@ impl AdaptiveJitterBuffer {
 
         // Bound maximum jitter buffer memory if a burst arrives.
         while self.packets.len() > self.max_capacity {
+            crate::diag::inc(&crate::diag::JB_OVERFLOW_DROPS); // DIAG
             if let Some(expected) = self.next_expected_seq {
                 self.packets.remove(&expected);
                 self.next_expected_seq = Some(expected.wrapping_add(1));
@@ -201,6 +204,7 @@ impl AdaptiveJitterBuffer {
             }
         }
 
+        crate::diag::set_max(&crate::diag::JB_DEPTH_MAX, self.packets.len() as u64); // DIAG
         if self.packets.len() >= self.target_depth {
             self.primed = true;
         }
@@ -269,12 +273,14 @@ impl MicDspPipeline {
             match self.jitter.pop_next() {
                 JitterPopResult::NotReady => break,
                 JitterPopResult::Frame(pcm16_bytes) => {
+                    crate::diag::inc(&crate::diag::JB_FRAMES); // DIAG
                     for chunk in pcm16_bytes.chunks_exact(2) {
                         let s16 = i16::from_le_bytes([chunk[0], chunk[1]]);
                         self.rnnoise_input_fifo.push_back(s16 as f32 / 32768.0);
                     }
                 }
                 JitterPopResult::LostPacket => {
+                    crate::diag::inc(&crate::diag::JB_LOST); // DIAG
                     // Conceal 10ms (480 samples) of zero-fill
                     for _ in 0..FRAME_SAMPLES_10MS {
                         self.rnnoise_input_fifo.push_back(0.0);
@@ -322,6 +328,13 @@ impl MicDspPipeline {
                 } else {
                     1.0
                 };
+                let diag_gated = gate_factor < 0.5; // DIAG
+                if diag_gated {
+                    crate::diag::inc(&crate::diag::VAD_GATED_FRAMES);
+                } // DIAG
+                if crate::diag::PREV_GATED.swap(diag_gated, Ordering::Relaxed) != diag_gated {
+                    crate::diag::inc(&crate::diag::VAD_GATE_TOGGLES); // DIAG
+                }
                 for i in 0..FRAME_SAMPLES_10MS {
                     processed_frame[i] = (scaled_out[i] / 32768.0) * gate_factor;
                 }
@@ -346,13 +359,17 @@ impl MicDspPipeline {
             let rms = (sum_sq / FRAME_SAMPLES_10MS as f32).sqrt();
             telemetry.store_mic_levels(peak, rms, vad_prob);
 
+            crate::diag::dump_dsp(&processed_frame); // DIAG (outside lock)
             let mut ring = output_ring.lock();
             // Bound ring buffer latency to 120ms max (~5760 samples at 48kHz)
             let max_ring_samples = (OPUS_SAMPLE_RATE as usize * 12) / 100;
             while ring.len() + FRAME_SAMPLES_10MS > max_ring_samples {
                 ring.pop_front();
+                crate::diag::inc(&crate::diag::RING_TRIM_SAMPLES); // DIAG
             }
             ring.extend(processed_frame);
+            crate::diag::set_max(&crate::diag::RING_HIGH_WATER, ring.len() as u64); // DIAG
+            crate::diag::inc(&crate::diag::DSP_FRAMES); // DIAG
         }
     }
 }
@@ -682,6 +699,22 @@ fn run_vbcable_mic_worker(
     let out_rate = supported_cfg.sample_rate().0;
     let out_channels = supported_cfg.channels() as usize;
 
+    crate::diag::emit(format!(
+        "[DIAG CFG] out_device='{}' is_vbcable={} default_fmt={:?} rate={} ch={} buf_range={:?} requested=Fixed({})",
+        vbcable_name_slot.lock(),
+        is_vbcable,
+        out_format,
+        out_rate,
+        out_channels,
+        supported_cfg.buffer_size(),
+        (out_rate / 200).max(128)
+    ));
+    if let Ok(cfgs) = output_device.supported_output_configs() {
+        for c in cfgs {
+            crate::diag::emit(format!("[DIAG CFG]   supported: {:?}", c));
+        }
+    }
+
     let preferred_frames = (out_rate / 200).max(128);
     let low_latency_cfg = StreamConfig {
         channels: supported_cfg.channels(),
@@ -696,6 +729,7 @@ fn run_vbcable_mic_worker(
 
     let err_fn = |err| {
         log::warn!("VB-CABLE output stream error: {err}");
+        crate::diag::emit(format!("[DIAG ERR] VB-CABLE output stream error: {err}")); // DIAG
     };
 
     let build_output = |stream_cfg: &StreamConfig| -> Result<cpal::Stream, cpal::BuildStreamError> {
@@ -750,9 +784,23 @@ fn run_vbcable_mic_worker(
         }
     };
 
-    let stream = build_output(&low_latency_cfg)
-        .or_else(|_| build_output(&default_cfg))
-        .map_err(|e| AudioEngineError::BuildStreamError(e.to_string()))?;
+    let stream = match build_output(&low_latency_cfg) {
+        Ok(s) => {
+            crate::diag::emit(format!(
+                "[DIAG CFG] opened LOW-LATENCY cfg {:?}",
+                low_latency_cfg
+            ));
+            s
+        }
+        Err(e) => {
+            crate::diag::emit(format!(
+                "[DIAG CFG] low-latency rejected ({e}); using DEFAULT cfg {:?}",
+                default_cfg
+            ));
+            build_output(&default_cfg)
+                .map_err(|e| AudioEngineError::BuildStreamError(e.to_string()))?
+        }
+    };
 
     stream
         .play()
@@ -773,7 +821,12 @@ fn run_vbcable_mic_worker(
                 dsp.process_available(&cfg_snapshot, &telemetry, &output_ring);
             }
             Err(mpsc::error::TryRecvError::Empty) => {
+                let diag_t = crate::diag::now_us(); // DIAG
                 std::thread::sleep(std::time::Duration::from_millis(1));
+                let diag_slept = crate::diag::now_us() - diag_t; // DIAG
+                crate::diag::inc(&crate::diag::WORKER_SLEEP_N); // DIAG
+                crate::diag::add(&crate::diag::WORKER_SLEEP_SUM_US, diag_slept); // DIAG
+                crate::diag::set_max(&crate::diag::WORKER_SLEEP_MAX_US, diag_slept); // DIAG
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
@@ -853,7 +906,10 @@ fn fill_output_buffer_f32(
         return;
     }
     let out_frames = out.len() / out_channels;
+    let diag_t_enter = crate::diag::now_us(); // DIAG
     let mut guard = ring.lock();
+    let diag_t_locked = crate::diag::now_us(); // DIAG
+    let diag_ring_before = guard.len(); // DIAG
 
     if out_rate == OPUS_SAMPLE_RATE {
         for frame_idx in 0..out_frames {
@@ -880,6 +936,13 @@ fn fill_output_buffer_f32(
             }
         }
     }
+    crate::diag::on_output_callback(
+        diag_t_enter,
+        diag_t_locked,
+        out_frames,
+        out_rate,
+        diag_ring_before,
+    ); // DIAG
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 pub mod audio_engine;
+pub mod diag;
 pub mod network;
 pub mod protocol;
 
@@ -137,6 +138,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(app_state)
         .setup(move |app| {
+            diag::spawn_reporter();
             let (outbound_opus_tx, outbound_opus_rx) = mpsc::channel(256);
             let (inbound_mic_tx, inbound_mic_rx) = mpsc::channel(256);
 
