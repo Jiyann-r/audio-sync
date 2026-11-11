@@ -535,12 +535,9 @@ public final class NetworkClient: ObservableObject {
             guard let self = self else { return }
             switch state {
             case .ready:
-                self.lastPacketReceivedAt = .now()
                 self.lastInboundPcSeq = nil
                 DispatchQueue.main.async {
-                    self.isConnected = true
-                    self.connectedServerName = displayName
-                    self.connectionStateText = "Connected (\(displayName))"
+                    self.connectionStateText = "Socket ready, reaching \(displayName)..."
                 }
                 self.startReceiveLoopOnQueue(for: conn)
                 self.startKeepaliveTimerOnQueue()
@@ -782,11 +779,17 @@ public final class NetworkClient: ObservableObject {
                 DispatchTime.now().uptimeNanoseconds &- self.lastPacketReceivedAt.uptimeNanoseconds
             ) / 1_000_000_000.0
 
-            if elapsedSinceRecv > 6.0 {
+            if elapsedSinceRecv > 3.0 {
+                DispatchQueue.main.async {
+                    if self.isConnected {
+                        self.isConnected = false
+                        self.connectionStateText = "Searching for PC..."
+                    }
+                }
                 // Re-send handshake and trigger socket recovery if peer stopped responding
                 self.sendHandshakeOnQueue()
-                if elapsedSinceRecv > 10.0 {
-                    self.scheduleReconnectOnQueue(delay: 0.2)
+                if elapsedSinceRecv > 8.0 {
+                    self.scheduleReconnectOnQueue(delay: 0.5)
                 }
             }
         }

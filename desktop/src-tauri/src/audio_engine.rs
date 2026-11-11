@@ -6,21 +6,23 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, Device, SampleFormat, StreamConfig};
 use nnnoiseless::DenoiseState;
 use parking_lot::Mutex;
-use rusty_opus::{Application, OpusDecoder, OpusEncoder};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::protocol::{sequence_diff, FramedPacket};
 
-/// Standard Opus operating sample rate (48,000 Hz).
+/// Standard audio operating sample rate (48,000 Hz).
 pub const OPUS_SAMPLE_RATE: u32 = 48_000;
+
+/// 5ms stereo frame size at 48kHz (240 samples per channel = 480 interleaved samples = 960 bytes PCM16).
+pub const FRAME_SAMPLES_5MS: usize = 240;
 
 /// 10ms frame size at 48kHz (480 samples per channel) — matches RNNoise `DenoiseState::FRAME_SIZE`.
 pub const FRAME_SAMPLES_10MS: usize = DenoiseState::FRAME_SIZE; // 480
 
-/// Maximum Opus packet size in bytes.
-pub const MAX_OPUS_FRAME_BYTES: usize = 1275;
+/// Maximum UDP audio frame bytes (960 bytes for 5ms Stereo 16-bit PCM, well below 1472 MTU).
+pub const MAX_AUDIO_FRAME_BYTES: usize = 1400;
 
 #[derive(Debug, Error)]
 pub enum AudioEngineError {
@@ -235,24 +237,16 @@ impl AdaptiveJitterBuffer {
 
 /// Stateful DSP processor combining Opus decoding, RNNoise AI denoising, VAD gate, and Gain boost.
 pub struct MicDspPipeline {
-    decoder: OpusDecoder,
     rnnoise: Box<DenoiseState<'static>>,
     jitter: AdaptiveJitterBuffer,
-    decode_scratch: Vec<f32>,
     rnnoise_input_fifo: VecDeque<f32>,
 }
 
 impl MicDspPipeline {
     pub fn new(jitter_depth: usize) -> Result<Self, AudioEngineError> {
-        let decoder = OpusDecoder::new(OPUS_SAMPLE_RATE as i32, 1)
-            .map_err(|e| AudioEngineError::OpusError(format!("{e:?}")))?;
-
         Ok(Self {
-            decoder,
             rnnoise: DenoiseState::new(),
             jitter: AdaptiveJitterBuffer::new(jitter_depth),
-            // Up to 20ms at 48kHz mono = 960 samples
-            decode_scratch: vec![0.0f32; FRAME_SAMPLES_10MS * 2],
             rnnoise_input_fifo: VecDeque::with_capacity(FRAME_SAMPLES_10MS * 4),
         })
     }
@@ -264,7 +258,7 @@ impl MicDspPipeline {
             .push(packet.header.sequence_num, packet.payload);
     }
 
-    /// Decodes available jitter-buffered packets, runs RNNoise + Gain Boost, and pushes 48kHz mono
+    /// Ingests available jitter-buffered packets (16-bit PCM Mono), runs RNNoise + Gain Boost, and pushes 48kHz mono
     /// samples into `output_ring`.
     pub fn process_available(
         &mut self,
@@ -275,27 +269,16 @@ impl MicDspPipeline {
         loop {
             match self.jitter.pop_next() {
                 JitterPopResult::NotReady => break,
-                JitterPopResult::Frame(opus_bytes) => {
-                    let max_frame_samples = self.decode_scratch.len();
-                    if let Ok(decoded_samples) = self.decoder.decode(
-                        opus_bytes.as_slice(),
-                        max_frame_samples,
-                        &mut self.decode_scratch[..],
-                    ) {
-                        for &sample in &self.decode_scratch[..decoded_samples] {
-                            self.rnnoise_input_fifo.push_back(sample);
-                        }
+                JitterPopResult::Frame(pcm16_bytes) => {
+                    for chunk in pcm16_bytes.chunks_exact(2) {
+                        let s16 = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        self.rnnoise_input_fifo.push_back(s16 as f32 / 32768.0);
                     }
                 }
                 JitterPopResult::LostPacket => {
-                    // Conceal 10ms (480 samples) using Opus native PLC (empty packet slice `&[]`)
-                    let plc_slice = &mut self.decode_scratch[..FRAME_SAMPLES_10MS];
-                    if let Ok(concealed) =
-                        self.decoder.decode(&[], FRAME_SAMPLES_10MS, plc_slice)
-                    {
-                        for &sample in &self.decode_scratch[..concealed] {
-                            self.rnnoise_input_fifo.push_back(sample);
-                        }
+                    // Conceal 10ms (480 samples) of zero-fill
+                    for _ in 0..FRAME_SAMPLES_10MS {
+                        self.rnnoise_input_fifo.push_back(0.0);
                     }
                 }
             }
@@ -624,22 +607,7 @@ fn run_wasapi_loopback_worker(
         .play()
         .map_err(|e| AudioEngineError::PlayStreamError(e.to_string()))?;
 
-    // Initialize low-delay stereo 48kHz pure-Rust Opus encoder
-    let mut encoder = OpusEncoder::new(
-        OPUS_SAMPLE_RATE as i32,
-        2,
-        Application::RestrictedLowDelay,
-    )
-    .map_err(|e| AudioEngineError::OpusError(format!("{e:?}")))?;
-
-    let mut current_bitrate = {
-        let cfg = config.lock();
-        cfg.opus_bitrate_bps.clamp(32_000, 128_000)
-    };
-    encoder.bitrate_bps = current_bitrate;
-
     let mut stereo_48k_fifo: VecDeque<f32> = VecDeque::with_capacity(OPUS_SAMPLE_RATE as usize * 2);
-    let mut opus_out_buf = vec![0u8; MAX_OPUS_FRAME_BYTES];
 
     while running.load(Ordering::Relaxed) {
         match pcm_rx.recv_timeout(std::time::Duration::from_millis(25)) {
@@ -651,13 +619,6 @@ fn run_wasapi_loopback_worker(
                     continue;
                 }
 
-                // Dynamically update Opus bitrate if user adjusted slider
-                let target_bitrate = cfg_snapshot.opus_bitrate_bps.clamp(32_000, 128_000);
-                if target_bitrate != current_bitrate {
-                    encoder.bitrate_bps = target_bitrate;
-                    current_bitrate = target_bitrate;
-                }
-
                 // Convert arbitrary channel count & sample rate to 48kHz Stereo interleaved
                 convert_to_48k_stereo(
                     &raw_interleaved,
@@ -667,12 +628,8 @@ fn run_wasapi_loopback_worker(
                     &mut stereo_48k_fifo,
                 );
 
-                // 10ms = 480 stereo frames (960 interleaved f32), 20ms = 960 stereo frames (1920 f32)
-                let frame_samples_per_ch = if cfg_snapshot.frame_duration_ms == 20 {
-                    FRAME_SAMPLES_10MS * 2
-                } else {
-                    FRAME_SAMPLES_10MS
-                };
+                // 5ms = 240 stereo frames (480 interleaved f32 = 960 bytes PCM16)
+                let frame_samples_per_ch = FRAME_SAMPLES_5MS;
                 let interleaved_frame_len = frame_samples_per_ch * 2;
 
                 while stereo_48k_fifo.len() >= interleaved_frame_len {
@@ -684,14 +641,13 @@ fn run_wasapi_loopback_worker(
                     let (peak, rms) = compute_peak_and_rms(&pcm_frame);
                     telemetry.store_pc_levels(peak, rms);
 
-                    if let Ok(encoded_len) = encoder.encode(
-                        &pcm_frame[..],
-                        frame_samples_per_ch,
-                        &mut opus_out_buf[..],
-                    ) {
-                        let packet_bytes = opus_out_buf[..encoded_len].to_vec();
-                        let _ = outbound_opus_tx.try_send(packet_bytes);
+                    // Pack into pristine 16-bit Little-Endian PCM (480 samples * 2 = 960 bytes, zero codec mismatch)
+                    let mut pcm16_bytes = Vec::with_capacity(interleaved_frame_len * 2);
+                    for &s in &pcm_frame {
+                        let clamped = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                        pcm16_bytes.extend_from_slice(&clamped.to_le_bytes());
                     }
+                    let _ = outbound_opus_tx.try_send(pcm16_bytes);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -749,7 +705,12 @@ fn run_vbcable_mic_worker(
             SampleFormat::F32 => output_device.build_output_stream(
                 stream_cfg,
                 move |data: &mut [f32], _| {
-                    fill_output_buffer_f32(data, out_channels, out_rate, &ring);
+                    if !is_vbcable {
+                        // Safety silence: never blast mic into main PC speakers to prevent feedback loop
+                        data.fill(0.0);
+                    } else {
+                        fill_output_buffer_f32(data, out_channels, out_rate, &ring);
+                    }
                 },
                 err_fn,
                 None,
@@ -757,10 +718,14 @@ fn run_vbcable_mic_worker(
             SampleFormat::I16 => output_device.build_output_stream(
                 stream_cfg,
                 move |data: &mut [i16], _| {
-                    let mut temp = vec![0.0f32; data.len()];
-                    fill_output_buffer_f32(&mut temp, out_channels, out_rate, &ring);
-                    for (dst, &src) in data.iter_mut().zip(temp.iter()) {
-                        *dst = (src * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                    if !is_vbcable {
+                        data.fill(0);
+                    } else {
+                        let mut temp = vec![0.0f32; data.len()];
+                        fill_output_buffer_f32(&mut temp, out_channels, out_rate, &ring);
+                        for (dst, &src) in data.iter_mut().zip(temp.iter()) {
+                            *dst = (src * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                        }
                     }
                 },
                 err_fn,
@@ -769,10 +734,14 @@ fn run_vbcable_mic_worker(
             SampleFormat::U16 => output_device.build_output_stream(
                 stream_cfg,
                 move |data: &mut [u16], _| {
-                    let mut temp = vec![0.0f32; data.len()];
-                    fill_output_buffer_f32(&mut temp, out_channels, out_rate, &ring);
-                    for (dst, &src) in data.iter_mut().zip(temp.iter()) {
-                        *dst = ((src * 32767.0) + 32768.0).clamp(0.0, 65535.0) as u16;
+                    if !is_vbcable {
+                        data.fill(32768);
+                    } else {
+                        let mut temp = vec![0.0f32; data.len()];
+                        fill_output_buffer_f32(&mut temp, out_channels, out_rate, &ring);
+                        for (dst, &src) in data.iter_mut().zip(temp.iter()) {
+                            *dst = ((src * 32767.0) + 32768.0).clamp(0.0, 65535.0) as u16;
+                        }
                     }
                 },
                 err_fn,
@@ -920,27 +889,15 @@ mod tests {
     use crate::protocol::{PacketType, StreamId};
 
     #[test]
-    fn test_opus_encode_decode_and_rnnoise_pipeline() {
-        let mut encoder = OpusEncoder::new(
-            OPUS_SAMPLE_RATE as i32,
-            1,
-            Application::RestrictedLowDelay,
-        )
-        .expect("Opus encoder init");
-        encoder.bitrate_bps = 64_000;
-
+    fn test_pcm16_ingest_and_rnnoise_pipeline() {
         // Generate 10ms 440Hz sine wave at 48kHz (480 samples)
-        let mut pcm_in = [0.0f32; FRAME_SAMPLES_10MS];
-        for (i, sample) in pcm_in.iter_mut().enumerate() {
+        let mut pcm16_bytes = Vec::with_capacity(FRAME_SAMPLES_10MS * 2);
+        for i in 0..FRAME_SAMPLES_10MS {
             let t = i as f32 / OPUS_SAMPLE_RATE as f32;
-            *sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+            let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+            let s16 = (sample * 32767.0) as i16;
+            pcm16_bytes.extend_from_slice(&s16.to_le_bytes());
         }
-
-        let mut opus_buf = [0u8; MAX_OPUS_FRAME_BYTES];
-        let encoded_len = encoder
-            .encode(&pcm_in[..], FRAME_SAMPLES_10MS, &mut opus_buf[..])
-            .expect("encode float");
-        assert!(encoded_len > 0);
 
         let mut dsp = MicDspPipeline::new(1).expect("DSP pipeline init");
         let pkt = FramedPacket::new(
@@ -948,7 +905,7 @@ mod tests {
             StreamId::PhoneToPc,
             1,
             100,
-            opus_buf[..encoded_len].to_vec(),
+            pcm16_bytes,
         );
 
         let cfg = AudioConfig::default();

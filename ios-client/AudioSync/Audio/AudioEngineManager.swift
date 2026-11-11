@@ -512,19 +512,35 @@ public final class AudioEngineManager: ObservableObject {
 
     // MARK: - 2. Start / Stop AVAudioEngine (Mic Input Tap + PC Audio Output PlayerNode)
 
-    public func start() {
-        audioQueue.async { [weak self] in
-            guard let self = self, !self.isEngineRunning else { return }
+    public func requestMicrophonePermission(completion: @escaping (Bool) -> Void) {
+        if #available(iOS 17.0, *) {
+            AVAudioApplication.requestRecordPermission { granted in
+                DispatchQueue.main.async { completion(granted) }
+            }
+        } else {
+            AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                DispatchQueue.main.async { completion(granted) }
+            }
+        }
+    }
 
-            do {
-                try self.configureAudioSession()
-                try self.setupAndStartEngineOnQueue()
-                DispatchQueue.main.async {
-                    self.isEngineRunning = true
-                    self.audioStatusMessage = "48kHz Full-Duplex Active (5ms IO Buffer)"
+    public func start() {
+        requestMicrophonePermission { [weak self] granted in
+            guard let self = self else { return }
+            self.audioQueue.async {
+                guard !self.isEngineRunning else { return }
+                do {
+                    try self.configureAudioSession()
+                    try self.setupAndStartEngineOnQueue()
+                    DispatchQueue.main.async {
+                        self.isEngineRunning = true
+                        self.audioStatusMessage = granted
+                            ? "48kHz Stereo 16-bit PCM (5ms Buffer)"
+                            : "Mic Permission Denied in Settings"
+                    }
+                } catch {
+                    self.publishAudioStatus("AudioEngine start failed: \(error.localizedDescription)")
                 }
-            } catch {
-                self.publishAudioStatus("AudioEngine start failed: \(error.localizedDescription)")
             }
         }
     }
@@ -655,13 +671,15 @@ public final class AudioEngineManager: ObservableObject {
                     self.micRmsLevel = rms
                 }
 
-                if let encoder = self.micEncoder,
-                   let opusPacket = try? encoder.encode(
-                       pcm: pcmFrame,
-                       frameSamplesPerChannel: targetFrameSamples
-                   ) {
-                    self.networkClient?.sendMicrophoneOpusFrame(opusPacket)
+                // Pack into pristine 16-bit Mono Little-Endian PCM (Zero codec mismatch)
+                var pcm16Data = Data(capacity: targetFrameSamples * 2)
+                for s in pcmFrame {
+                    let clamped = min(max(s, -1.0), 1.0)
+                    let s16 = Int16(clamped * 32767.0)
+                    var le = s16.littleEndian
+                    withUnsafeBytes(of: &le) { pcm16Data.append(contentsOf: $0) }
                 }
+                self.networkClient?.sendMicrophoneOpusFrame(pcm16Data)
             }
         }
     }
@@ -713,31 +731,21 @@ public final class AudioEngineManager: ObservableObject {
         }
 
         pcJitterBuffer.push(sequenceNum: packet.header.sequenceNum, payload: packet.payload)
-        let expectedSamplesPerCh = (frameDurationMs == 20) ? kFrameSamples20ms : kFrameSamples10ms
 
         while true {
             switch pcJitterBuffer.popNext() {
             case .notReady:
                 return
-            case .frame(let opusData):
-                if let decoder = pcDecoder,
-                   let stereoInterleaved = try? decoder.decode(
-                       packet: opusData,
-                       frameSamplesPerChannel: expectedSamplesPerCh
-                   ) {
-                    scheduleStereoPcmOnPlayerNode(stereoInterleaved)
-                }
+            case .frame(let pcm16Data):
+                scheduleStereoPcm16OnPlayerNode(pcm16Data)
             case .lostPacket:
-                if let decoder = pcDecoder {
-                    let concealedStereo = decoder.decodePLC(frameSamplesPerChannel: expectedSamplesPerCh)
-                    scheduleStereoPcmOnPlayerNode(concealedStereo)
-                }
+                break
             }
         }
     }
 
-    private func scheduleStereoPcmOnPlayerNode(_ interleavedStereo: [Float]) {
-        let frames = interleavedStereo.count / 2
+    private func scheduleStereoPcm16OnPlayerNode(_ pcmData: Data) {
+        let frames = pcmData.count / 4 // 2 channels * 2 bytes = 4 bytes per stereo frame
         guard frames > 0,
               let format = playbackFormat,
               let pcmBuffer = AVAudioPCMBuffer(
@@ -756,15 +764,18 @@ public final class AudioEngineManager: ObservableObject {
         var peak: Float = 0.0
         var sumSq: Float = 0.0
 
-        for f in 0..<frames {
-            let l = min(max(interleavedStereo[f * 2] * vol, -1.0), 1.0)
-            let r = min(max(interleavedStereo[f * 2 + 1] * vol, -1.0), 1.0)
-            leftDst[f] = l
-            rightDst[f] = r
+        pcmData.withUnsafeBytes { rawPtr in
+            guard let base = rawPtr.bindMemory(to: Int16.self).baseAddress else { return }
+            for f in 0..<frames {
+                let l = (Float(Int16(littleEndian: base[f * 2])) / 32768.0) * vol
+                let r = (Float(Int16(littleEndian: base[f * 2 + 1])) / 32768.0) * vol
+                leftDst[f] = min(max(l, -1.0), 1.0)
+                rightDst[f] = min(max(r, -1.0), 1.0)
 
-            let maxAbs = max(abs(l), abs(r))
-            if maxAbs > peak { peak = maxAbs }
-            sumSq += (l * l + r * r) * 0.5
+                let maxAbs = max(abs(l), abs(r))
+                if maxAbs > peak { peak = maxAbs }
+                sumSq += (l * l + r * r) * 0.5
+            }
         }
 
         let rms = sqrt(sumSq / Float(frames))

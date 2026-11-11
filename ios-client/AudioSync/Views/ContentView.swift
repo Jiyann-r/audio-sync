@@ -397,7 +397,7 @@ struct ContentView: View {
                     .font(.system(size: 11, weight: .bold))
                     .foregroundColor(Color.white.opacity(0.5))
                 Spacer()
-                Text("48 kHz Opus")
+                Text("48 kHz PCM (5ms)")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundColor(.cyan)
             }
