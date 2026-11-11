@@ -80,10 +80,6 @@ struct AnimatedVuMeterView: View {
                         .fill(isPeakLit ? segmentColor(for: idx) : Color.white.opacity(0.07))
                         .opacity(isRmsLit ? 1.0 : (isPeakLit ? 0.82 : 0.38))
                         .frame(height: 12)
-                        .shadow(
-                            color: isPeakLit ? segmentColor(for: idx).opacity(0.55) : .clear,
-                            radius: 3
-                        )
                 }
             }
             .padding(5)
@@ -93,7 +89,6 @@ struct AnimatedVuMeterView: View {
                 Capsule()
                     .stroke(Color.white.opacity(0.10), lineWidth: 1)
             )
-            .animation(.spring(response: 0.14, dampingFraction: 0.78), value: activePeakSegments)
         }
     }
 }
@@ -362,25 +357,40 @@ struct ContentView: View {
             HStack(spacing: 8) {
                 ForEach(AudioOutputRoute.allCases) { route in
                     let isSelected = (audioManager.selectedOutputRoute == route)
+                    let isAvailable = (route != .bluetooth || audioManager.isBluetoothConnected)
+
                     Button(action: {
+                        guard isAvailable else { return }
                         audioManager.selectedOutputRoute = route
                     }) {
-                        HStack(spacing: 6) {
-                            Image(systemName: iconName(for: route))
-                                .font(.system(size: 12, weight: .semibold))
-                            Text(route.rawValue)
-                                .font(.system(size: 12, weight: .semibold))
+                        VStack(spacing: 4) {
+                            HStack(spacing: 6) {
+                                Image(systemName: iconName(for: route))
+                                    .font(.system(size: 12, weight: .semibold))
+                                Text(route.rawValue)
+                                    .font(.system(size: 12, weight: .semibold))
+                            }
+                            if route == .bluetooth && !audioManager.isBluetoothConnected {
+                                Text("No Device")
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundColor(Color.white.opacity(0.4))
+                            }
                         }
-                        .foregroundColor(isSelected ? .black : .white)
+                        .foregroundColor(
+                            !isAvailable
+                                ? Color.white.opacity(0.35)
+                                : (isSelected ? .black : .white)
+                        )
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
+                        .padding(.vertical, route == .bluetooth && !audioManager.isBluetoothConnected ? 7 : 10)
                         .background(
-                            isSelected
-                                ? Color.cyan
-                                : Color.white.opacity(0.07)
+                            !isAvailable
+                                ? Color.white.opacity(0.03)
+                                : (isSelected ? Color.cyan : Color.white.opacity(0.07))
                         )
                         .clipShape(Capsule())
                     }
+                    .disabled(!isAvailable)
                 }
             }
         }

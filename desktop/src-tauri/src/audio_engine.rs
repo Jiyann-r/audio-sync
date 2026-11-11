@@ -218,9 +218,8 @@ impl AdaptiveJitterBuffer {
 
         if let Some(payload) = self.packets.remove(&expected) {
             self.next_expected_seq = Some(expected.wrapping_add(1));
-            if self.packets.is_empty() {
-                self.primed = false;
-            }
+            // Note: Do NOT un-prime if queue is empty; transient empty queue during normal packet flow
+            // should not stall playback for an entire target_depth refill cycle!
             return JitterPopResult::Frame(payload);
         }
 
@@ -230,7 +229,7 @@ impl AdaptiveJitterBuffer {
             return JitterPopResult::LostPacket;
         }
 
-        self.primed = false;
+        // Buffer is temporarily starved of future packets
         JitterPopResult::NotReady
     }
 }

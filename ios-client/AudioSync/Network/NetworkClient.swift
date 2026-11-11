@@ -358,6 +358,11 @@ public final class NetworkClient: ObservableObject {
     private var pingSeq: UInt16 = 0
     private var lastInboundPcSeq: UInt16?
     private var lastPacketReceivedAt: DispatchTime = .now()
+
+    // Internal counters to prevent saturating the main thread with 100-200 dispatches/sec
+    private var internalPacketsSent: UInt64 = 0
+    private var internalPacketsReceived: UInt64 = 0
+    private var internalPacketsLost: UInt64 = 0
     private var reconnectWorkItem: DispatchWorkItem?
 
     public init() {
@@ -637,9 +642,9 @@ public final class NetworkClient: ObservableObject {
 
     private func handleInboundPacketOnQueue(_ packet: FramedPacket) {
         lastPacketReceivedAt = .now()
-        DispatchQueue.main.async {
-            self.packetsReceived &+= 1
-            if !self.isConnected {
+        internalPacketsReceived &+= 1
+        if !isConnected {
+            DispatchQueue.main.async {
                 self.isConnected = true
             }
         }
@@ -651,9 +656,7 @@ public final class NetworkClient: ObservableObject {
                 let diff = sequenceDiff(packet.header.sequenceNum, prevSeq)
                 if diff > 1 {
                     let lostCount = UInt64(diff - 1)
-                    DispatchQueue.main.async {
-                        self.packetsLost &+= lostCount
-                    }
+                    internalPacketsLost &+= lostCount
                 }
             }
             lastInboundPcSeq = packet.header.sequenceNum
@@ -758,9 +761,7 @@ public final class NetworkClient: ObservableObject {
         conn.send(content: wireData, completion: .contentProcessed { [weak self] error in
             guard let self = self else { return }
             if error == nil {
-                DispatchQueue.main.async {
-                    self.packetsSent &+= 1
-                }
+                self.internalPacketsSent &+= 1
             }
         })
     }
@@ -774,6 +775,16 @@ public final class NetworkClient: ObservableObject {
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
             self.sendPingOnQueue()
+
+            // Synchronize telemetry counters once per second on MainQueue
+            let sent = self.internalPacketsSent
+            let received = self.internalPacketsReceived
+            let lost = self.internalPacketsLost
+            DispatchQueue.main.async {
+                self.packetsSent = sent
+                self.packetsReceived = received
+                self.packetsLost = lost
+            }
 
             let elapsedSinceRecv = Double(
                 DispatchTime.now().uptimeNanoseconds &- self.lastPacketReceivedAt.uptimeNanoseconds

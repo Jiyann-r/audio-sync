@@ -403,7 +403,9 @@ public final class AudioEngineManager: ObservableObject {
     @Published public var selectedOutputRoute: AudioOutputRoute = .speaker {
         didSet {
             useSpeakerphoneOutput = (selectedOutputRoute == .speaker)
-            updateAudioOutputRoute()
+            audioQueue.async { [weak self] in
+                self?.updateAudioOutputRoute()
+            }
         }
     }
     @Published public var useSpeakerphoneOutput: Bool = true {
@@ -411,9 +413,14 @@ public final class AudioEngineManager: ObservableObject {
             if useSpeakerphoneOutput && selectedOutputRoute != .speaker {
                 selectedOutputRoute = .speaker
             }
-            updateAudioOutputRoute()
+            audioQueue.async { [weak self] in
+                self?.updateAudioOutputRoute()
+            }
         }
     }
+
+    /// Dynamically detects whether a Bluetooth audio device (AirPods, headset, A2DP/HFP) is connected.
+    @Published public private(set) var isBluetoothConnected: Bool = false
 
     // Live Peak & RMS VU levels (0.0 .. 1.0)
     @Published public private(set) var micPeakLevel: Float = 0.0
@@ -434,6 +441,10 @@ public final class AudioEngineManager: ObservableObject {
     private var micSampleFifo: [Float] = []
     private var playbackFormat: AVAudioFormat?
 
+    // UI telemetry rate-limiting timestamps (50ms = ~20 FPS)
+    private var lastMicUiUpdateNanoseconds: UInt64 = 0
+    private var lastPcUiUpdateNanoseconds: UInt64 = 0
+
     public init(networkClient: NetworkClient? = nil) {
         self.networkClient = networkClient
         self.micEncoder = try? SwiftOpusEncoder(
@@ -449,6 +460,7 @@ public final class AudioEngineManager: ObservableObject {
 
         bindNetworkCallbacks()
         setupAudioSessionNotifications()
+        checkBluetoothConnectionStatus()
     }
 
     public func attachNetworkClient(_ client: NetworkClient) {
@@ -663,19 +675,26 @@ public final class AudioEngineManager: ObservableObject {
                 let pcmFrame = Array(self.micSampleFifo.prefix(targetFrameSamples))
                 self.micSampleFifo.removeFirst(targetFrameSamples)
 
-                let (peak, rms) = Self.computePeakAndRms(pcmFrame)
-                DispatchQueue.main.async {
-                    self.micPeakLevel = peak
-                    self.micRmsLevel = rms
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                if nowNs &- self.lastMicUiUpdateNanoseconds >= 50_000_000 {
+                    self.lastMicUiUpdateNanoseconds = nowNs
+                    let (peak, rms) = Self.computePeakAndRms(pcmFrame)
+                    DispatchQueue.main.async {
+                        self.micPeakLevel = peak
+                        self.micRmsLevel = rms
+                    }
                 }
 
-                // Pack into pristine 16-bit Mono Little-Endian PCM (Zero codec mismatch)
-                var pcm16Data = Data(capacity: targetFrameSamples * 2)
-                for s in pcmFrame {
-                    let clamped = min(max(s, -1.0), 1.0)
-                    let s16 = Int16(clamped * 32767.0)
-                    var le = s16.littleEndian
-                    withUnsafeBytes(of: &le) { pcm16Data.append(contentsOf: $0) }
+                // Pack into pristine 16-bit Mono Little-Endian PCM with direct contiguous unsafe pointer write (zero per-sample allocations)
+                var pcm16Data = Data(count: targetFrameSamples * 2)
+                pcm16Data.withUnsafeMutableBytes { rawBuf in
+                    guard let dstPtr = rawBuf.bindMemory(to: Int16.self).baseAddress else { return }
+                    for i in 0..<targetFrameSamples {
+                        let s = pcmFrame[i]
+                        let clamped = min(max(s, -1.0), 1.0)
+                        let s16 = Int16(clamped * 32767.0)
+                        dstPtr[i] = s16.littleEndian
+                    }
                 }
                 self.networkClient?.sendMicrophoneOpusFrame(pcm16Data)
             }
@@ -776,10 +795,14 @@ public final class AudioEngineManager: ObservableObject {
             }
         }
 
-        let rms = sqrt(sumSq / Float(frames))
-        DispatchQueue.main.async {
-            self.pcPeakLevel = peak
-            self.pcRmsLevel = rms
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        if nowNs &- self.lastPcUiUpdateNanoseconds >= 50_000_000 {
+            self.lastPcUiUpdateNanoseconds = nowNs
+            let rms = sqrt(sumSq / Float(frames))
+            DispatchQueue.main.async {
+                self.pcPeakLevel = peak
+                self.pcRmsLevel = rms
+            }
         }
 
         if !playerNode.isPlaying && audioEngine.isRunning {
@@ -842,11 +865,42 @@ public final class AudioEngineManager: ObservableObject {
             object: AVAudioSession.sharedInstance(),
             queue: nil
         ) { [weak self] _ in
-            guard let self = self, self.isEngineRunning else { return }
-            self.audioQueue.async {
-                if !self.audioEngine.isRunning {
-                    try? self.setupAndStartEngineOnQueue()
+            guard let self = self else { return }
+            self.checkBluetoothConnectionStatus()
+            if self.isEngineRunning {
+                self.audioQueue.async {
+                    if !self.audioEngine.isRunning {
+                        try? self.setupAndStartEngineOnQueue()
+                    }
                 }
+            }
+        }
+    }
+
+    /// Inspects available audio session input/output ports to verify if Bluetooth is actively connected.
+    public func checkBluetoothConnectionStatus() {
+        let session = AVAudioSession.sharedInstance()
+        let outputs = session.currentRoute.outputs
+        let inputs = session.availableInputs ?? []
+
+        let btOutput = outputs.contains { port in
+            port.portType == .bluetoothA2DP ||
+            port.portType == .bluetoothHFP ||
+            port.portType == .bluetoothLE
+        }
+        let btInput = inputs.contains { port in
+            port.portType == .bluetoothHFP ||
+            port.portType == .bluetoothA2DP ||
+            port.portType == .bluetoothLE
+        }
+
+        let isBtAvailable = btOutput || btInput
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.isBluetoothConnected = isBtAvailable
+            if !isBtAvailable && self.selectedOutputRoute == .bluetooth {
+                // If Bluetooth was active but disconnected, gracefully revert to Loudspeaker
+                self.selectedOutputRoute = .speaker
             }
         }
     }
