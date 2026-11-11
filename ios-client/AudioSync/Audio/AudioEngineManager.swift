@@ -461,10 +461,10 @@ public final class AudioEngineManager: ObservableObject {
     public func configureAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
 
-        // Configure .playAndRecord with .voiceChat mode and [.defaultToSpeaker, .allowBluetooth, .mixWithOthers]
+        // Configure .playAndRecord with .voiceChat mode and [.defaultToSpeaker, .allowBluetoothHFP, .mixWithOthers]
         var options: AVAudioSession.CategoryOptions = [
             .defaultToSpeaker,
-            .allowBluetooth,
+            .allowBluetoothHFP,
             .mixWithOthers
         ]
         if #available(iOS 10.0, *) {

@@ -352,7 +352,7 @@ public final class NetworkClient: ObservableObject {
 
     private var currentTargetEndpoint: NWEndpoint?
     private var isUserInitiatedDisconnect: Bool = false
-    private let startTimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    @usableFromInline internal let startTimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
 
     private var outboundMicSeq: UInt16 = 0
     private var pingSeq: UInt16 = 0
