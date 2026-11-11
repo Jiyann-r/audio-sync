@@ -1,0 +1,85 @@
+name: Build iOS Unsigned IPA (Sideloadly)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "ios-client/**"
+      - ".github/workflows/build-ios.yml"
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - "ios-client/**"
+      - ".github/workflows/build-ios.yml"
+  workflow_dispatch:
+
+jobs:
+  build-ios-ipa:
+    name: Archive & Package Unsigned iOS IPA (iPhone 13)
+    runs-on: macos-14
+
+    defaults:
+      run:
+        working-directory: ios-client
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode & Verify Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Resolve Swift Package Manager Dependencies
+        run: |
+          if [ -f "Package.swift" ]; then
+            swift package resolve
+          fi
+          xcodebuild -resolvePackageDependencies \
+            -project AudioSync.xcodeproj \
+            -scheme AudioSync
+
+      - name: Build Unsigned .xcarchive for iOS (arm64)
+        run: |
+          xcodebuild archive \
+            -project AudioSync.xcodeproj \
+            -scheme AudioSync \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/AudioSync.xcarchive" \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package .app into Payload and Create AudioSync-iPhone13.ipa
+        run: |
+          APP_PATH="$RUNNER_TEMP/AudioSync.xcarchive/Products/Applications/AudioSync.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Error: AudioSync.app not found at $APP_PATH"
+            exit 1
+          fi
+
+          rm -rf "$RUNNER_TEMP/ipa_stage"
+          mkdir -p "$RUNNER_TEMP/ipa_stage/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa_stage/Payload/AudioSync.app"
+
+          cd "$RUNNER_TEMP/ipa_stage"
+          zip -r -9 "$GITHUB_WORKSPACE/AudioSync-iPhone13.ipa" Payload
+          ls -lh "$GITHUB_WORKSPACE/AudioSync-iPhone13.ipa"
+
+      - name: Upload AudioSync-iPhone13.ipa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AudioSync-iPhone13.ipa
+          path: ${{ github.workspace }}/AudioSync-iPhone13.ipa
+          retention-days: 30
+          if-no-files-found: error
