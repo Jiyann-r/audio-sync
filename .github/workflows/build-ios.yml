@@ -20,7 +20,7 @@ on:
 jobs:
   build-ios-ipa:
     name: Archive & Package Unsigned iOS IPA (iPhone 13)
-    runs-on: macos-14
+    runs-on: macos-13
 
     defaults:
       run:
