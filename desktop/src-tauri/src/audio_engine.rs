@@ -67,7 +67,7 @@ pub struct AudioConfig {
     pub opus_bitrate_bps: i32,
     /// Frame duration in milliseconds (10 or 20).
     pub frame_duration_ms: u8,
-    /// Jitter buffer target depth in packets (1 to 10).
+    /// Jitter buffer target depth in packets (1 to 32).
     pub jitter_buffer_packets: usize,
     /// Preferred virtual mic output device name substring (defaults to "CABLE Input").
     pub virtual_mic_device_hint: String,
@@ -88,7 +88,7 @@ impl Default for AudioConfig {
             pc_volume: 1.0,
             opus_bitrate_bps: 64_000,
             frame_duration_ms: 10,
-            jitter_buffer_packets: 2,
+            jitter_buffer_packets: 8,
             virtual_mic_device_hint: "CABLE Input".to_string(),
         }
     }
@@ -158,7 +158,7 @@ pub enum JitterPopResult {
 
 impl AdaptiveJitterBuffer {
     pub fn new(target_depth: usize) -> Self {
-        let target_depth = target_depth.clamp(1, 16);
+        let target_depth = target_depth.clamp(1, 32);
         Self {
             packets: BTreeMap::new(),
             next_expected_seq: None,
@@ -169,7 +169,7 @@ impl AdaptiveJitterBuffer {
     }
 
     pub fn set_target_depth(&mut self, depth: usize) {
-        self.target_depth = depth.clamp(1, 16);
+        self.target_depth = depth.clamp(1, 32);
         self.max_capacity = self.target_depth * 6;
     }
 
@@ -233,8 +233,32 @@ impl AdaptiveJitterBuffer {
             return JitterPopResult::LostPacket;
         }
 
-        // Buffer is temporarily starved of future packets
+        // Buffer is temporarily starved of future packets; un-prime so it buffers incoming bursts
+        self.primed = false;
         JitterPopResult::NotReady
+    }
+}
+
+/// Shared 48kHz mono PCM ring buffer & Adaptive Sample Rate Converter (ASRC) state.
+pub struct OutputRingState {
+    pub ring: VecDeque<f32>,
+    pub primed: bool,
+    pub frac_pos: f64,
+}
+
+impl OutputRingState {
+    pub fn new() -> Self {
+        Self {
+            ring: VecDeque::with_capacity(OPUS_SAMPLE_RATE as usize),
+            primed: false,
+            frac_pos: 0.0,
+        }
+    }
+}
+
+impl Default for OutputRingState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -267,7 +291,7 @@ impl MicDspPipeline {
         &mut self,
         config: &AudioConfig,
         telemetry: &AtomicAudioTelemetry,
-        output_ring: &Mutex<VecDeque<f32>>,
+        output_ring: &Mutex<OutputRingState>,
     ) {
         loop {
             match self.jitter.pop_next() {
@@ -281,9 +305,11 @@ impl MicDspPipeline {
                 }
                 JitterPopResult::LostPacket => {
                     crate::diag::inc(&crate::diag::JB_LOST); // DIAG
-                    // Conceal 10ms (480 samples) of zero-fill
-                    for _ in 0..FRAME_SAMPLES_10MS {
-                        self.rnnoise_input_fifo.push_back(0.0);
+                    // Smooth concealment: smoothly decay from the last valid sample rather than abrupt silence step
+                    let last_sample = self.rnnoise_input_fifo.back().copied().unwrap_or(0.0);
+                    for i in 0..FRAME_SAMPLES_10MS {
+                        let decay = 1.0 - (i as f32 / FRAME_SAMPLES_10MS as f32);
+                        self.rnnoise_input_fifo.push_back(last_sample * decay * 0.7);
                     }
                 }
             }
@@ -305,10 +331,10 @@ impl MicDspPipeline {
 
             if !is_active {
                 telemetry.store_mic_levels(0.0, 0.0, 0.0);
-                let mut ring = output_ring.lock();
+                let mut guard = output_ring.lock();
                 for _ in 0..FRAME_SAMPLES_10MS {
-                    if ring.len() < OPUS_SAMPLE_RATE as usize {
-                        ring.push_back(0.0);
+                    if guard.ring.len() < OPUS_SAMPLE_RATE as usize {
+                        guard.ring.push_back(0.0);
                     }
                 }
                 continue;
@@ -360,15 +386,15 @@ impl MicDspPipeline {
             telemetry.store_mic_levels(peak, rms, vad_prob);
 
             crate::diag::dump_dsp(&processed_frame); // DIAG (outside lock)
-            let mut ring = output_ring.lock();
-            // Bound ring buffer latency to 120ms max (~5760 samples at 48kHz)
-            let max_ring_samples = (OPUS_SAMPLE_RATE as usize * 12) / 100;
-            while ring.len() + FRAME_SAMPLES_10MS > max_ring_samples {
-                ring.pop_front();
+            let mut guard = output_ring.lock();
+            // Bound ring buffer latency to 500ms max (24,000 samples at 48kHz) so bursts of 100-150ms are never trimmed
+            let max_ring_samples = (OPUS_SAMPLE_RATE as usize * 50) / 100;
+            while guard.ring.len() + FRAME_SAMPLES_10MS > max_ring_samples {
+                guard.ring.pop_front();
                 crate::diag::inc(&crate::diag::RING_TRIM_SAMPLES); // DIAG
             }
-            ring.extend(processed_frame);
-            crate::diag::set_max(&crate::diag::RING_HIGH_WATER, ring.len() as u64); // DIAG
+            guard.ring.extend(processed_frame);
+            crate::diag::set_max(&crate::diag::RING_HIGH_WATER, guard.ring.len() as u64); // DIAG
             crate::diag::inc(&crate::diag::DSP_FRAMES); // DIAG
         }
     }
@@ -724,8 +750,8 @@ fn run_vbcable_mic_worker(
     let default_cfg: StreamConfig = supported_cfg.into();
 
     // Shared 48kHz mono PCM ring buffer between DSP processor and VB-CABLE output callback
-    let output_ring: Arc<Mutex<VecDeque<f32>>> =
-        Arc::new(Mutex::new(VecDeque::with_capacity(OPUS_SAMPLE_RATE as usize)));
+    let output_ring: Arc<Mutex<OutputRingState>> =
+        Arc::new(Mutex::new(OutputRingState::new()));
 
     let err_fn = |err| {
         log::warn!("VB-CABLE output stream error: {err}");
@@ -806,17 +832,17 @@ fn run_vbcable_mic_worker(
         .play()
         .map_err(|e| AudioEngineError::PlayStreamError(e.to_string()))?;
 
-    let initial_jitter = config.lock().jitter_buffer_packets.max(3);
+    let initial_jitter = config.lock().jitter_buffer_packets.max(8);
     let mut dsp = MicDspPipeline::new(initial_jitter)?;
 
     while running.load(Ordering::Relaxed) {
         match inbound_mic_rx.try_recv() {
             Ok(pkt) => {
                 let cfg_snapshot = config.lock().clone();
-                dsp.ingest_packet(pkt, cfg_snapshot.jitter_buffer_packets.max(3));
+                dsp.ingest_packet(pkt, cfg_snapshot.jitter_buffer_packets.max(8));
                 // Drain any immediately queued packets before running DSP
                 while let Ok(more_pkt) = inbound_mic_rx.try_recv() {
-                    dsp.ingest_packet(more_pkt, cfg_snapshot.jitter_buffer_packets.max(3));
+                    dsp.ingest_packet(more_pkt, cfg_snapshot.jitter_buffer_packets.max(8));
                 }
                 dsp.process_available(&cfg_snapshot, &telemetry, &output_ring);
             }
@@ -894,48 +920,97 @@ fn convert_to_48k_stereo(
     }
 }
 
-/// Fills the VB-CABLE output slice from the 48kHz mono ring buffer, duplicating across output channels
-/// and adjusting for device sample rate if needed.
+const PRIME_THRESHOLD_SAMPLES: usize = 7200; // 150ms pre-roll cushion to absorb 100ms iPhone capture bursts
+
+/// Fills the VB-CABLE output slice from the 48kHz mono ring buffer at exact 1.0x pitch (no pitch warping),
+/// duplicating across output channels and cleanly handling sample rate conversion if the output device is not 48kHz.
 fn fill_output_buffer_f32(
     out: &mut [f32],
     out_channels: usize,
     out_rate: u32,
-    ring: &Mutex<VecDeque<f32>>,
+    ring_state: &Mutex<OutputRingState>,
 ) {
     if out_channels == 0 || out.is_empty() {
         return;
     }
     let out_frames = out.len() / out_channels;
     let diag_t_enter = crate::diag::now_us(); // DIAG
-    let mut guard = ring.lock();
+    let mut guard = ring_state.lock();
     let diag_t_locked = crate::diag::now_us(); // DIAG
-    let diag_ring_before = guard.len(); // DIAG
+    let diag_ring_before = guard.ring.len(); // DIAG
 
+    // 1. Initial pre-roll / recovery priming (ensures at least 150ms buffer before output starts)
+    if !guard.primed {
+        if guard.ring.len() >= PRIME_THRESHOLD_SAMPLES {
+            guard.primed = true;
+        } else {
+            // Still priming: output silence
+            out.fill(0.0);
+            crate::diag::on_output_callback(
+                diag_t_enter,
+                diag_t_locked,
+                out_frames,
+                out_rate,
+                diag_ring_before,
+            );
+            return;
+        }
+    }
+
+    // 2. Playback: 1:1 direct copy at 48kHz (ZERO pitch warping or vibrato), or clean resample if device is 44.1kHz
     if out_rate == OPUS_SAMPLE_RATE {
         for frame_idx in 0..out_frames {
-            let sample = guard.pop_front().unwrap_or(0.0);
-            let base = frame_idx * out_channels;
-            for ch in 0..out_channels {
-                out[base + ch] = sample;
+            if let Some(sample) = guard.ring.pop_front() {
+                let base = frame_idx * out_channels;
+                for ch in 0..out_channels {
+                    out[base + ch] = sample;
+                }
+            } else {
+                // Buffer ran empty: un-prime so we rebuild pre-roll cushion cleanly
+                guard.primed = false;
+                for i in (frame_idx * out_channels)..out.len() {
+                    out[i] = 0.0;
+                }
+                break;
             }
         }
     } else {
-        // Simple step conversion from 48kHz mono ring to `out_rate`
-        let step = OPUS_SAMPLE_RATE as f32 / out_rate as f32;
-        let mut accum = 0.0f32;
-        let mut current = guard.front().copied().unwrap_or(0.0);
+        // Linear interpolation without pitch modulation (constant ratio)
+        let step = OPUS_SAMPLE_RATE as f64 / out_rate as f64;
         for frame_idx in 0..out_frames {
-            accum += step;
-            while accum >= 1.0 {
-                current = guard.pop_front().unwrap_or(0.0);
-                accum -= 1.0;
+            if guard.ring.is_empty() {
+                guard.primed = false;
+                guard.frac_pos = 0.0;
+                for i in (frame_idx * out_channels)..out.len() {
+                    out[i] = 0.0;
+                }
+                break;
             }
+
+            let s0 = guard.ring.front().copied().unwrap_or(0.0);
+            let s1 = if guard.ring.len() > 1 {
+                guard.ring.get(1).copied().unwrap_or(s0)
+            } else {
+                s0
+            };
+
+            let interp_sample = s0 + (s1 - s0) * (guard.frac_pos as f32);
             let base = frame_idx * out_channels;
             for ch in 0..out_channels {
-                out[base + ch] = current;
+                out[base + ch] = interp_sample;
+            }
+
+            guard.frac_pos += step;
+            while guard.frac_pos >= 1.0 {
+                guard.ring.pop_front();
+                guard.frac_pos -= 1.0;
+                if guard.ring.is_empty() {
+                    break;
+                }
             }
         }
     }
+
     crate::diag::on_output_callback(
         diag_t_enter,
         diag_t_locked,
@@ -972,11 +1047,11 @@ mod tests {
 
         let cfg = AudioConfig::default();
         let telemetry = AtomicAudioTelemetry::default();
-        let output_ring = Mutex::new(VecDeque::new());
+        let output_ring = Mutex::new(OutputRingState::new());
 
         dsp.ingest_packet(pkt, 1);
         dsp.process_available(&cfg, &telemetry, &output_ring);
 
-        assert_eq!(output_ring.lock().len(), FRAME_SAMPLES_10MS);
+        assert_eq!(output_ring.lock().ring.len(), FRAME_SAMPLES_10MS);
     }
 }
