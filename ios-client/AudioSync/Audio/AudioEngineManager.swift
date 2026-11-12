@@ -670,7 +670,7 @@ public final class AudioEngineManager: ObservableObject {
 
             if abs(sourceRate - kOpusSampleRate) < 1.0 {
                 for i in 0..<frameCount {
-                    let boosted = tanh(srcChannel0[i] * gainLinear)
+                    let boosted = tanh(diagSnapshot[i] * gainLinear)
                     self.micSampleFifo.append(boosted)
                 }
             } else {
@@ -682,8 +682,8 @@ public final class AudioEngineManager: ObservableObject {
                     let idx0 = min(Int(floor(srcPos)), frameCount - 1)
                     let idx1 = min(idx0 + 1, frameCount - 1)
                     let frac = Float(srcPos - Double(idx0))
-                    let s0 = srcChannel0[idx0]
-                    let s1 = srcChannel0[idx1]
+                    let s0 = diagSnapshot[idx0]
+                    let s1 = diagSnapshot[idx1]
                     let interpolated = s0 + (s1 - s0) * frac
                     let boosted = tanh(interpolated * gainLinear)
                     self.micSampleFifo.append(boosted)

@@ -349,6 +349,8 @@ public final class NetworkClient: ObservableObject {
     private var connection: NWConnection?
     private var pathMonitor: NWPathMonitor?
     private var keepaliveTimer: DispatchSourceTimer?
+    private var outboundMicQueue: [Data] = []
+    private var micPacingTimer: DispatchSourceTimer?
 
     private var currentTargetEndpoint: NWEndpoint?
     private var isUserInitiatedDisconnect: Bool = false
@@ -574,6 +576,9 @@ public final class NetworkClient: ObservableObject {
     }
 
     private func teardownConnectionOnQueue() {
+        micPacingTimer?.cancel()
+        micPacingTimer = nil
+        outboundMicQueue.removeAll(keepingCapacity: true)
         keepaliveTimer?.cancel()
         keepaliveTimer = nil
         if let conn = connection {
@@ -694,10 +699,32 @@ public final class NetworkClient: ObservableObject {
 
     // MARK: - Outbound Audio & Control Transmission
 
-    /// Sends an encoded 48kHz mono Opus microphone frame to the Windows PC (`StreamId.phoneToPc = 0x02`).
+    /// Enqueues an encoded 48kHz mono Opus microphone frame and paces transmission at a steady 10ms interval.
     public func sendMicrophoneOpusFrame(_ opusData: Data) {
         netQueue.async { [weak self] in
             guard let self = self else { return }
+            self.outboundMicQueue.append(opusData)
+            // Limit queue depth to 20 frames (200ms) to prevent latency runaway if network stalls
+            if self.outboundMicQueue.count > 20 {
+                self.outboundMicQueue.removeFirst(self.outboundMicQueue.count - 20)
+            }
+            self.ensureMicPacingTimerRunningOnQueue()
+        }
+    }
+
+    private func ensureMicPacingTimerRunningOnQueue() {
+        guard micPacingTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: netQueue)
+        // Fire every 10ms (100 packets/sec) with 1ms leeway
+        timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            guard !self.outboundMicQueue.isEmpty else {
+                self.micPacingTimer?.cancel()
+                self.micPacingTimer = nil
+                return
+            }
+            let opusData = self.outboundMicQueue.removeFirst()
             MicDiag.shared.onMicSend(payloadBytes: opusData.count) // DIAG
             let seq = self.outboundMicSeq
             self.outboundMicSeq &+= 1
@@ -712,6 +739,8 @@ public final class NetworkClient: ObservableObject {
             )
             self.sendRawFramedPacketOnQueue(pkt)
         }
+        timer.resume()
+        micPacingTimer = timer
     }
 
     /// Sends a control message (e.g. MuteState or StreamConfig) to the Windows PC.
